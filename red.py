@@ -1,57 +1,114 @@
 import cv2
 import numpy as np
 import subprocess
-import time
+import gpiod
+from motor_control import MotorController
 
-def capture_frame():
-    """Capture a single JPEG frame using libcamera-still."""
-    result = subprocess.run(
-        ["libcamera-still", "-n", "--immediate", "--width", "640", "--height", "360",
-         "--quality", "85", "--timeout", "1", "-o", "-"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
-    )
-    return np.frombuffer(result.stdout, dtype=np.uint8)
+# Camera resolution
+WIDTH, HEIGHT = 640, 360
 
-def detect_red_from_buffer(jpeg_bytes):
-    """Detect red areas in the JPEG byte array."""
-    img_array = np.asarray(jpeg_bytes, dtype=np.uint8)
-    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+# Launch libcamera-vid and ffmpeg for MJPEG capture
+libcamera_cmd = [
+    "libcamera-vid",
+    "--codec", "mjpeg",
+    "--width", str(WIDTH),
+    "--height", str(HEIGHT),
+    "--inline",
+    "--framerate", "30",
+    "--timeout", "0",
+    "--nopreview",
+    "--output", "-"
+]
 
-    if frame is None:
-        print("❌ Failed to decode frame")
-        return False
+ffmpeg_cmd = [
+    "ffmpeg",
+    "-loglevel", "quiet",
+    "-f", "mjpeg",
+    "-i", "pipe:0",
+    "-f", "rawvideo",
+    "-pix_fmt", "bgr24",
+    "pipe:1"
+]
 
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+frame_size = WIDTH * HEIGHT * 3
 
-    lower_red1 = np.array([0, 120, 70])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 120, 70])
-    upper_red2 = np.array([180, 255, 255])
+# Initialize motors
+chip = gpiod.Chip("gpiochip0")
+x_motor = MotorController(chip, 5, 23, 18, name="XMotor")
+y_motor = MotorController(chip, 19, 25, 21, name="YMotor")
 
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    red_mask = mask1 | mask2
+x_motor.set_enable(False)
+y_motor.set_enable(False)
 
-    red_pixels = cv2.countNonZero(red_mask)
+# Start video stream
+libcamera = subprocess.Popen(libcamera_cmd, stdout=subprocess.PIPE)
+ffmpeg = subprocess.Popen(ffmpeg_cmd, stdin=libcamera.stdout, stdout=subprocess.PIPE)
 
-    return red_pixels > 500
+print("🔴 Centering on red floppy disk. Ctrl+C to exit.")
 
-# ========== MAIN LOOP ==========
+dead_zone = 50
+min_area = 1200
 
-print("Starting red detection at 10 Hz... (Press Ctrl+C to stop)")
 try:
     while True:
-        start = time.time()
+        raw = ffmpeg.stdout.read(frame_size)
+        if len(raw) != frame_size:
+            print("Frame read error")
+            continue
 
-        jpeg_bytes = capture_frame()
-        if detect_red_from_buffer(jpeg_bytes):
-            print("🔴 Red detected!")
+        frame = np.frombuffer(raw, np.uint8).reshape((HEIGHT, WIDTH, 3))
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # Delay to maintain ~10 Hz (100ms/frame)
-        elapsed = time.time() - start
-        sleep_time = max(0, 0.1 - elapsed)
-        time.sleep(sleep_time)
+        lower_red1 = np.array([0, 80, 50])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 80, 50])
+        upper_red2 = np.array([180, 255, 255])
+
+        mask = cv2.inRange(hsv, lower_red1, upper_red1) | cv2.inRange(hsv, lower_red2, upper_red2)
+        mask = cv2.GaussianBlur(mask, (5, 5), 0)
+        mask = cv2.erode(mask, None, iterations=2)
+        mask = cv2.dilate(mask, None, iterations=2)
+
+        M = cv2.moments(mask)
+        if M["m00"] > min_area:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            offset_x = cx - WIDTH // 2
+            offset_y = cy - HEIGHT // 2
+
+            print(f"Center: ({cx}, {cy}) | Offset: X={offset_x}, Y={offset_y}")
+
+            # Adjust step_delay dynamically based on proximity to center
+            def compute_delay(offset):
+                abs_offset = abs(offset)
+                return 0.001 - (0.00195 * (abs_offset / WIDTH))
+
+            # X axis control
+            if abs(offset_x) > dead_zone:
+                x_motor.set_enable(True)
+                x_motor.set_direction(1 if offset_x > 0 else 0)
+                x_motor.step_delay = compute_delay(offset_x)
+                x_motor.step(1)
+            else:
+                x_motor.set_enable(False)
+
+            # Y axis control
+            if abs(offset_y) > dead_zone:
+                y_motor.set_enable(True)
+                y_motor.set_direction(1 if offset_y > 0 else 0)
+                y_motor.step_delay = compute_delay(offset_y)
+                y_motor.step(1)
+            else:
+                y_motor.set_enable(False)
+        else:
+            x_motor.set_enable(False)
+            y_motor.set_enable(False)
+            print("Red target not found")
 
 except KeyboardInterrupt:
-    print("\nStopped.")
+    print("\nExiting...")
+finally:
+    x_motor.set_enable(False)
+    y_motor.set_enable(False)
+    libcamera.terminate()
+    ffmpeg.terminate()

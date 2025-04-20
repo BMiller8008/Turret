@@ -6,8 +6,9 @@ import termios
 import tty
 
 class MotorController:
-    def __init__(self, chip: gpiod.Chip, step_gpio, dir_gpio, en_gpio, name="Motor"):
+    def __init__(self, chip: gpiod.Chip, step_gpio, dir_gpio, en_gpio, name="Motor", step_delay=0.001):
         self.name = name
+        self.step_delay = step_delay  # Faster motor speed
         self.chip = chip
         self.step_line = chip.get_line(step_gpio)
         self.dir_line = chip.get_line(dir_gpio)
@@ -27,9 +28,9 @@ class MotorController:
         while True:
             if self.enabled:
                 self.step_line.set_value(1)
-                time.sleep(0.001)
+                time.sleep(self.step_delay)
                 self.step_line.set_value(0)
-                time.sleep(0.001)
+                time.sleep(self.step_delay)
             else:
                 time.sleep(0.01)
 
@@ -43,19 +44,25 @@ class MotorController:
         self.dir_line.set_value(direction)
 
     def toggle_enable(self):
-        self.enabled = not self.enabled
-        self.en_line.set_value(not self.enabled)
-        print(f"{self.name} {'enabled' if self.enabled else 'disabled'}")
+        self.set_enable(not self.enabled)
 
     def set_enable(self, enable: bool):
         self.enabled = enable
         self.en_line.set_value(not enable)
+        print(f"{self.name} {'enabled' if enable else 'disabled'}")
 
     def is_enabled(self):
         return self.enabled
 
     def get_direction(self):
         return self.direction
+
+    def step(self, count=1):
+        for _ in range(count):
+            self.step_line.set_value(1)
+            time.sleep(self.step_delay)
+            self.step_line.set_value(0)
+            time.sleep(self.step_delay)
 
 class MotorManager:
     def __init__(self, motors):
